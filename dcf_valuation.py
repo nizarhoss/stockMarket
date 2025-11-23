@@ -124,12 +124,21 @@ def fetch_stock_data(ticker):
             return None
 
         # Get Free Cash Flow (Operating Cash Flow - Capital Expenditures)
+        # Note: yfinance returns columns in reverse chronological order (newest first)
         historic_fcf = []
+
+        # Get columns sorted in chronological order (oldest to newest)
+        sorted_columns = sorted(cash_flow.columns)
 
         # Try to get FCF directly
         if 'Free Cash Flow' in cash_flow.index:
             fcf_row = cash_flow.loc['Free Cash Flow']
-            historic_fcf = [v / 1_000_000 for v in fcf_row.values if v is not None and not (isinstance(v, float) and v != v)]  # Convert to millions, filter NaN
+            # Extract values in chronological order (oldest to newest)
+            for col in sorted_columns:
+                value = fcf_row[col]
+                # Check if value is valid (not NaN)
+                if value is not None and not (isinstance(value, float) and value != value):
+                    historic_fcf.append(value / 1_000_000)  # Convert to millions
         else:
             # Calculate FCF = Operating Cash Flow - Capital Expenditures
             ocf_row = None
@@ -142,17 +151,29 @@ def fetch_stock_data(ticker):
                     capex_row = cash_flow.loc[idx]
 
             if ocf_row is not None and capex_row is not None:
-                for ocf, capex in zip(ocf_row.values, capex_row.values):
+                # Extract values in chronological order (oldest to newest)
+                for col in sorted_columns:
+                    ocf = ocf_row[col]
+                    capex = capex_row[col]
                     if ocf is not None and capex is not None:
-                        # CapEx is usually negative, so we add it
-                        fcf = (ocf + capex) / 1_000_000  # Convert to millions
-                        historic_fcf.append(fcf)
+                        # Check for NaN
+                        if not (isinstance(ocf, float) and ocf != ocf) and not (isinstance(capex, float) and capex != capex):
+                            # CapEx is usually negative, so we add it (OCF + CapEx)
+                            # If CapEx is positive in the data, we need to subtract it
+                            if capex > 0:
+                                fcf = (ocf - capex) / 1_000_000
+                            else:
+                                fcf = (ocf + capex) / 1_000_000
+                            historic_fcf.append(fcf)
 
-        # Reverse to get chronological order (oldest to newest)
-        historic_fcf.reverse()
-
-        # Calculate growth rate
+        # Calculate growth rate (CAGR)
         fcf_growth_rate = calculate_cagr(historic_fcf) if len(historic_fcf) >= 2 else 0.0
+
+        # Debug: Show FCF trend to verify ordering is correct
+        if len(historic_fcf) >= 2:
+            trend = "increasing" if historic_fcf[-1] > historic_fcf[0] else "decreasing"
+            # Uncomment for debugging:
+            # print(f"Debug: FCF trend is {trend} (oldest: ${historic_fcf[0]:.2f}M, newest: ${historic_fcf[-1]:.2f}M)")
 
         # Get current price and market cap
         current_price = info.get('currentPrice', info.get('regularMarketPrice', None))
@@ -192,9 +213,18 @@ def display_stock_data(ticker, data):
         print(f"Shares Outstanding: {data['shares_outstanding']:,.2f}M")
 
     if data['historic_fcf']:
-        print(f"\nHistorical Free Cash Flow ({len(data['historic_fcf'])} years):")
-        for i, fcf in enumerate(data['historic_fcf'], 1):
-            print(f"  Year -{len(data['historic_fcf'])-i}: ${fcf:,.2f}M")
+        print(f"\nHistorical Free Cash Flow ({len(data['historic_fcf'])} years, oldest to newest):")
+        for i, fcf in enumerate(data['historic_fcf']):
+            # Show as "Year 1" (oldest), "Year 2", ... "Year N" (newest/most recent)
+            year_label = f"Year {i+1}" + (" (oldest)" if i == 0 else " (most recent)" if i == len(data['historic_fcf'])-1 else "")
+            print(f"  {year_label}: ${fcf:,.2f}M")
+
+        # Show trend indicator
+        if len(data['historic_fcf']) >= 2:
+            fcf_change = data['historic_fcf'][-1] - data['historic_fcf'][0]
+            fcf_change_pct = (fcf_change / abs(data['historic_fcf'][0])) * 100
+            trend_symbol = "↗" if fcf_change > 0 else "↘"
+            print(f"\n  Trend: {trend_symbol} ${abs(fcf_change):,.2f}M ({fcf_change_pct:+.1f}%) over period")
 
         print(f"\nCalculated Historical FCF Growth Rate (CAGR): {data['fcf_growth_rate']*100:.2f}%")
 
