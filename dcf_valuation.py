@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
 """
-DCF (Discounted Cash Flow) Valuation Calculator
+DCF (Discounted Cash Flow) Valuation Calculator with API Integration
 
 This script calculates the intrinsic value of a stock using the DCF method.
-It projects future free cash flows, calculates terminal value, and discounts
-them back to present value.
+It automatically fetches historical financial data from Yahoo Finance API,
+calculates growth rates, and projects future free cash flows.
 """
+
+import sys
+import json
+from statistics import mean
+
+# Try to import yfinance, fall back to manual data entry if not available
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
+    print("Note: yfinance not installed. Install with: pip install yfinance")
+    print("Continuing with manual data entry mode...\n")
+
 
 def get_float_input(prompt, default=None):
     """Get float input from user with optional default value."""
@@ -39,6 +53,154 @@ def get_int_input(prompt, default=None):
             print("Invalid input. Please enter a valid integer.")
 
 
+def calculate_cagr(values):
+    """
+    Calculate Compound Annual Growth Rate from a list of values.
+
+    Parameters:
+    -----------
+    values : list
+        List of values in chronological order
+
+    Returns:
+    --------
+    float : CAGR as decimal (e.g., 0.15 for 15%)
+    """
+    if len(values) < 2:
+        return 0.0
+
+    # Remove None values and zeros
+    valid_values = [v for v in values if v is not None and v > 0]
+
+    if len(valid_values) < 2:
+        return 0.0
+
+    start_value = valid_values[0]
+    end_value = valid_values[-1]
+    num_periods = len(valid_values) - 1
+
+    if start_value <= 0:
+        return 0.0
+
+    cagr = (end_value / start_value) ** (1 / num_periods) - 1
+    return cagr
+
+
+def fetch_stock_data(ticker):
+    """
+    Fetch historical financial data for a stock using yfinance.
+
+    Parameters:
+    -----------
+    ticker : str
+        Stock ticker symbol
+
+    Returns:
+    --------
+    dict : Dictionary containing:
+        - shares_outstanding: Number of shares (in millions)
+        - historic_fcf: List of historical free cash flows
+        - fcf_growth_rate: Calculated CAGR of FCF
+        - current_price: Current stock price
+        - market_cap: Market capitalization
+    """
+    if not YFINANCE_AVAILABLE:
+        return None
+
+    try:
+        stock = yf.Ticker(ticker)
+
+        # Get shares outstanding
+        info = stock.info
+        shares = info.get('sharesOutstanding', None)
+        if shares:
+            shares = shares / 1_000_000  # Convert to millions
+
+        # Get historical cash flow data
+        cash_flow = stock.cashflow
+
+        if cash_flow.empty:
+            print(f"Warning: No cash flow data available for {ticker}")
+            return None
+
+        # Get Free Cash Flow (Operating Cash Flow - Capital Expenditures)
+        historic_fcf = []
+
+        # Try to get FCF directly
+        if 'Free Cash Flow' in cash_flow.index:
+            fcf_row = cash_flow.loc['Free Cash Flow']
+            historic_fcf = [v / 1_000_000 for v in fcf_row.values if v is not None and not (isinstance(v, float) and v != v)]  # Convert to millions, filter NaN
+        else:
+            # Calculate FCF = Operating Cash Flow - Capital Expenditures
+            ocf_row = None
+            capex_row = None
+
+            for idx in cash_flow.index:
+                if 'Operating Cash Flow' in str(idx) or 'Total Cash From Operating Activities' in str(idx):
+                    ocf_row = cash_flow.loc[idx]
+                if 'Capital Expenditure' in str(idx) or 'Capital Expenditures' in str(idx):
+                    capex_row = cash_flow.loc[idx]
+
+            if ocf_row is not None and capex_row is not None:
+                for ocf, capex in zip(ocf_row.values, capex_row.values):
+                    if ocf is not None and capex is not None:
+                        # CapEx is usually negative, so we add it
+                        fcf = (ocf + capex) / 1_000_000  # Convert to millions
+                        historic_fcf.append(fcf)
+
+        # Reverse to get chronological order (oldest to newest)
+        historic_fcf.reverse()
+
+        # Calculate growth rate
+        fcf_growth_rate = calculate_cagr(historic_fcf) if len(historic_fcf) >= 2 else 0.0
+
+        # Get current price and market cap
+        current_price = info.get('currentPrice', info.get('regularMarketPrice', None))
+        market_cap = info.get('marketCap', None)
+        if market_cap:
+            market_cap = market_cap / 1_000_000  # Convert to millions
+
+        return {
+            'shares_outstanding': shares,
+            'historic_fcf': historic_fcf,
+            'fcf_growth_rate': fcf_growth_rate,
+            'current_price': current_price,
+            'market_cap': market_cap,
+            'company_name': info.get('longName', ticker)
+        }
+
+    except Exception as e:
+        print(f"Error fetching data for {ticker}: {e}")
+        return None
+
+
+def display_stock_data(ticker, data):
+    """Display fetched stock data."""
+    print("\n" + "="*70)
+    print(f"FETCHED DATA FOR {ticker.upper()}")
+    if 'company_name' in data and data['company_name']:
+        print(f"Company: {data['company_name']}")
+    print("="*70)
+
+    if data['current_price']:
+        print(f"Current Price: ${data['current_price']:.2f}")
+
+    if data['market_cap']:
+        print(f"Market Cap: ${data['market_cap']:,.2f}M")
+
+    if data['shares_outstanding']:
+        print(f"Shares Outstanding: {data['shares_outstanding']:,.2f}M")
+
+    if data['historic_fcf']:
+        print(f"\nHistorical Free Cash Flow ({len(data['historic_fcf'])} years):")
+        for i, fcf in enumerate(data['historic_fcf'], 1):
+            print(f"  Year -{len(data['historic_fcf'])-i}: ${fcf:,.2f}M")
+
+        print(f"\nCalculated Historical FCF Growth Rate (CAGR): {data['fcf_growth_rate']*100:.2f}%")
+
+    print("="*70)
+
+
 def get_fcf_projections(years):
     """Get FCF projections from user."""
     print(f"\nEnter Free Cash Flow projections for {years} years (in millions):")
@@ -54,7 +216,7 @@ def get_fcf_projections(years):
 def get_fcf_with_growth(initial_fcf, growth_rate, years):
     """Calculate FCF projections based on initial FCF and growth rate."""
     fcf_list = []
-    for i in range(years):
+    for i in range(1, years + 1):
         fcf = initial_fcf * ((1 + growth_rate) ** i)
         fcf_list.append(fcf)
     return fcf_list
@@ -137,7 +299,7 @@ def dcf_valuation(fcf_list, wacc, terminal_growth, shares):
     }
 
 
-def display_results(ticker, result, wacc, terminal_growth, shares):
+def display_results(ticker, result, wacc, terminal_growth, shares, current_price=None):
     """Display DCF valuation results in a formatted way."""
     print("\n" + "="*70)
     print(f"DCF VALUATION RESULTS FOR {ticker.upper()}")
@@ -172,6 +334,19 @@ def display_results(ticker, result, wacc, terminal_growth, shares):
     print(f"INTRINSIC VALUE PER SHARE:                  ${result['intrinsic_value']:.2f}")
     print("="*70)
 
+    # Show comparison with current market price if available
+    if current_price:
+        print(f"\nCurrent Market Price:                       ${current_price:.2f}")
+        diff = result['intrinsic_value'] - current_price
+        diff_pct = (diff / current_price) * 100
+
+        if diff > 0:
+            print(f"Potential Upside:                           ${diff:.2f} ({diff_pct:.2f}%)")
+            print("=> Stock appears UNDERVALUED")
+        else:
+            print(f"Potential Downside:                         ${abs(diff):.2f} ({abs(diff_pct):.2f}%)")
+            print("=> Stock appears OVERVALUED")
+
     print("\nKEY ASSUMPTIONS:")
     print(f"  - WACC (Discount Rate):      {wacc*100:.2f}%")
     print(f"  - Terminal Growth Rate:      {terminal_growth*100:.2f}%")
@@ -182,10 +357,20 @@ def main():
     """Main function to run DCF valuation calculator."""
     print("="*70)
     print("DCF (DISCOUNTED CASH FLOW) VALUATION CALCULATOR")
+    print("With Automatic Financial Data Fetching")
     print("="*70)
 
     # Get stock ticker
     ticker = input("\nEnter stock ticker symbol: ").strip().upper()
+
+    # Try to fetch stock data automatically
+    stock_data = None
+    if YFINANCE_AVAILABLE:
+        print(f"\nFetching financial data for {ticker}...")
+        stock_data = fetch_stock_data(ticker)
+
+        if stock_data:
+            display_stock_data(ticker, stock_data)
 
     # Get projection period
     print("\n--- PROJECTION PERIOD ---")
@@ -193,15 +378,51 @@ def main():
 
     # Get FCF projections
     print("\n--- FREE CASH FLOW PROJECTIONS ---")
-    print("Choose input method:")
-    print("  1. Enter FCF for each year manually")
-    print("  2. Use growth rate from initial FCF")
 
-    method = input("Enter choice (1 or 2): ").strip()
+    # Offer different input methods based on available data
+    if stock_data and stock_data.get('historic_fcf') and len(stock_data['historic_fcf']) > 0:
+        print("Choose input method:")
+        print("  1. Use historical growth rate (AUTO)")
+        print("  2. Use custom growth rate")
+        print("  3. Enter FCF for each year manually")
+        method = input("Enter choice (1, 2, or 3): ").strip()
+    else:
+        print("Choose input method:")
+        print("  1. Enter FCF for each year manually")
+        print("  2. Use growth rate from initial FCF")
+        method_map = {"1": "3", "2": "2"}
+        method = method_map.get(input("Enter choice (1 or 2): ").strip(), "3")
 
-    if method == "2":
+    if method == "1" and stock_data:
+        # Use historical data and growth rate
+        latest_fcf = stock_data['historic_fcf'][-1]
+        growth_rate = stock_data['fcf_growth_rate']
+
+        print(f"\nUsing latest FCF: ${latest_fcf:,.2f}M")
+        print(f"Using historical growth rate: {growth_rate*100:.2f}%")
+
+        # Ask if user wants to adjust
+        adjust = input("Would you like to adjust the growth rate? (y/n): ").strip().lower()
+        if adjust == 'y':
+            growth_rate = get_float_input("Enter adjusted FCF growth rate (as decimal)")
+
+        fcf_list = get_fcf_with_growth(latest_fcf, growth_rate, years)
+
+        print("\nProjected FCF:")
+        for i, fcf in enumerate(fcf_list, 1):
+            print(f"  Year {i}: ${fcf:,.2f}M")
+
+    elif method == "2":
         initial_fcf = get_float_input("\nEnter current/initial FCF (in millions)")
-        growth_rate = get_float_input("Enter FCF growth rate (as decimal, e.g., 0.15 for 15%)")
+
+        if stock_data and stock_data.get('fcf_growth_rate'):
+            default_growth = stock_data['fcf_growth_rate']
+            print(f"\nHistorical growth rate: {default_growth*100:.2f}%")
+            growth_rate = get_float_input("Enter FCF growth rate (as decimal, e.g., 0.15 for 15%)",
+                                         default=default_growth)
+        else:
+            growth_rate = get_float_input("Enter FCF growth rate (as decimal, e.g., 0.15 for 15%)")
+
         fcf_list = get_fcf_with_growth(initial_fcf, growth_rate, years)
 
         print("\nProjected FCF:")
@@ -220,12 +441,18 @@ def main():
 
     # Get shares outstanding
     print("\n--- SHARES OUTSTANDING ---")
-    shares = get_float_input("Enter shares outstanding (in millions)")
+    if stock_data and stock_data.get('shares_outstanding'):
+        default_shares = stock_data['shares_outstanding']
+        shares = get_float_input("Enter shares outstanding (in millions)", default=default_shares)
+    else:
+        shares = get_float_input("Enter shares outstanding (in millions)")
 
     # Calculate DCF valuation
     try:
         result = dcf_valuation(fcf_list, wacc, terminal_growth, shares)
-        display_results(ticker, result, wacc, terminal_growth, shares)
+
+        current_price = stock_data.get('current_price') if stock_data else None
+        display_results(ticker, result, wacc, terminal_growth, shares, current_price)
 
         # Optional: show sensitivity analysis prompt
         print("\n" + "="*70)
